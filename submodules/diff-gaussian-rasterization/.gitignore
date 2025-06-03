@@ -1,0 +1,4 @@
+build/
+diff_gaussian_rasterization.egg-info/
+dist/
+diff_gaussian_rasterization/_C.cpython-310-x86_64-linux-gnu.so
