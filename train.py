@@ -22,6 +22,9 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from stable_diffusion import Difix
+from scene.cameras import interpolate_camera
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -40,7 +43,11 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+import numpy as np
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations,
+             checkpoint_iterations, checkpoint, debug_from, distillation_iteration,
+             difix_model=None, alphas=(0.25, 0.5, 0.75, 1.0)):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -49,6 +56,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+    # ----------------------------------------------------------------
+    # Build (reference, target) pairs for pseudo‑view distillation
+    # ----------------------------------------------------------------
+    ref_cams   = scene.getTrainCameras()
+    target_cams = scene.getTestCameras()
+    if difix_model is None:
+        print("difix_mode is None")
+    else:
+        print("difix_mode is enabled")
+    print(f"ref_cam_size={len(ref_cams)},  target_cam_sizes={len(target_cams)}")
+
+    if difix_model is not None and target_cams:
+        # compute nearest ref for each target (smallest view‑dir angle)
+        pairs = []
+        for t in target_cams:
+            best, best_angle = None, 1e9
+            t_dir = torch.as_tensor(t.R[:, 2])
+            # t_dir = t.R[:, 2]               # camera -Z axis
+            for r in ref_cams:
+                ref_dir = torch.as_tensor(r.R[:, 2])
+                angle = torch.acos(torch.clamp(torch.dot(t_dir, ref_dir), -1.0, 1.0))
+                if angle < best_angle:
+                    best, best_angle = r, angle
+            pairs.append((best, t))
+    else:
+        pairs = []
+
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -138,6 +172,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = Ll1depth.item()
         else:
             Ll1depth = 0
+
+        # --------------------------------------------------------------
+        # PSEUDO‑VIEW DISTILLATION  (Difix3D⁺)
+        # --------------------------------------------------------------
+        if difix_model is not None and pairs and (iteration % distillation_iteration == 0):
+            # cyclic schedule through ALPHAS
+            alpha = alphas[ (iteration // 1000) % len(alphas) ]  # every 1000 iters move closer
+            ref_cam, tgt_cam = pairs[randint(0, len(pairs)-1)]
+            pseudo_cam = interpolate_camera(ref_cam, tgt_cam, alpha)
+            pseudo_pkg = render(pseudo_cam, gaussians, pipe, bg, 
+                                use_trained_exp=dataset.train_test_exp,
+                                separate_sh=SPARSE_ADAM_AVAILABLE)
+            pseudo_img = pseudo_pkg["render"]
+
+            # Clean with Difix (single‑step diffusion)
+            cleaned_pseudo = difix_model(pseudo_img.unsqueeze(0)).squeeze(0)
+
+            pseudo_loss = l1_loss(pseudo_img, cleaned_pseudo)
+            loss += 0.5 * pseudo_loss   # weight can be tuned (0.5 works well)
 
         loss.backward()
 
@@ -267,6 +320,10 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--use_difix", action="store_true",
+                        help="Enable Difix single‑step diffusion cleanup + distillation")
+    parser.add_argument('--distillation_iteration', type=int, default=5000,
+                        help="Iteration interval at which to run pseudo-view distillation")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -275,11 +332,21 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
+    # ------------------------------------------------------------
+    # Load Difix once if requested
+    # ------------------------------------------------------------
+    difix_model = None
+    if args.use_difix:
+        difix_model = Difix().to("cuda").eval()
+
     # Start GUI server, configure and run training
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args),
+             args.test_iterations, args.save_iterations, args.checkpoint_iterations,
+             args.start_checkpoint, args.debug_from, args.distillation_iteration,
+             difix_model)
 
     # All done
     print("\nTraining complete.")

@@ -15,6 +15,7 @@ import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 from utils.general_utils import PILtoTorch
 import cv2
+import copy
 
 class Camera(nn.Module):
     def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap,
@@ -87,6 +88,43 @@ class Camera(nn.Module):
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+
+    # ------------------------------------------------------------------
+    # Convenience: update intrinsic world‑view transforms after changing
+    # extrinsics (R / T) or global scene transform (trans / scale).
+    # ------------------------------------------------------------------
+    def set_pose(self, R: torch.Tensor, T: torch.Tensor,
+                 trans=None, scale=None):
+        """
+        Update camera extrinsics and recompute all dependent matrices.
+
+        Parameters
+        ----------
+        R : (3,3) torch tensor             – new rotation matrix
+        T : (3,)  torch tensor             – new translation vector
+        trans : (3,) np.ndarray OR torch   – global translation  (optional)
+        scale : float                      – global scale        (optional)
+        """
+        self.R = R
+        self.T = T
+        if trans is not None:
+            self.trans = np.array(trans) if isinstance(trans, (list, tuple)) else trans
+        if scale is not None:
+            self.scale = scale
+
+        # Recompute transforms
+        self.world_view_transform = torch.tensor(
+            getWorld2View2(self.R.cpu().numpy(),
+                           self.T.cpu().numpy(),
+                           self.trans,
+                           self.scale),
+            dtype=torch.float32,
+            device=self.data_device).T  # .transpose(0,1)
+        self.full_proj_transform = (
+            self.world_view_transform.unsqueeze(0)
+            .bmm(self.projection_matrix.unsqueeze(0))
+        ).squeeze(0)
+        self.camera_center = self.world_view_transform.inverse()[3, :3]
         
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
@@ -101,3 +139,75 @@ class MiniCam:
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
 
+
+
+# --- Quaternion helpers & camera‑pose interpolation --------------------
+import torch
+
+def _rot_to_quat(R: torch.Tensor) -> torch.Tensor:
+    """
+    3×3 rotation matrix -> (w,x,y,z) unit quaternion
+    """
+    q = torch.empty(4, device=R.device, dtype=R.dtype)
+    trace = R.trace()
+    if trace > 0.0:
+        s = torch.sqrt(trace + 1.0) * 2.0
+        q[0] = 0.25 * s
+        q[1] = (R[2, 1] - R[1, 2]) / s
+        q[2] = (R[0, 2] - R[2, 0]) / s
+        q[3] = (R[1, 0] - R[0, 1]) / s
+    else:
+        i = torch.argmax(torch.diag(R))
+        j, k = (i + 1) % 3, (i + 2) % 3
+        s = torch.sqrt(R[i, i] - R[j, j] - R[k, k] + 1.0) * 2.0
+        q[i + 1] = 0.25 * s
+        q[0] = (R[k, j] - R[j, k]) / s
+        q[j + 1] = (R[j, i] + R[i, j]) / s
+        q[k + 1] = (R[k, i] + R[i, k]) / s
+    return q / q.norm()
+
+def _quat_slerp(q0: torch.Tensor, q1: torch.Tensor, t: float) -> torch.Tensor:
+    """
+    Spherical‑linear interpolation between two unit quaternions.
+    """
+    dot = torch.dot(q0, q1)
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    DOT_THR = 0.9995
+    if dot > DOT_THR:
+        return (1.0 - t) * q0 + t * q1
+    theta_0 = torch.acos(dot)
+    theta = theta_0 * t
+    sin_t0 = torch.sin(theta_0)
+    return (torch.sin(theta_0 - theta) * q0 + torch.sin(theta) * q1) / sin_t0
+
+def interpolate_camera(ref_cam, tgt_cam, alpha: float = 0.5):
+    """
+    Returns a *clone* of ref_cam whose pose is interpolated toward tgt_cam
+    by factor `alpha` (0 => ref, 1 => tgt).  Works even if .R/.T are NumPy.
+    """
+    device = "cuda"
+
+    def as_tensor(x):
+        return torch.as_tensor(x, device=device, dtype=torch.float32)
+
+    R_ref = as_tensor(ref_cam.R)
+    R_tgt = as_tensor(tgt_cam.R)
+    t_ref = as_tensor(ref_cam.T)
+    t_tgt = as_tensor(tgt_cam.T)
+
+    q_ref = _rot_to_quat(R_ref)
+    q_tgt = _rot_to_quat(R_tgt)
+    q_mid = _quat_slerp(q_ref, q_tgt, alpha)
+
+    w, x, y, z = q_mid
+    R_mid = torch.tensor([[1 - 2 * (y*y + z*z), 2 * (x*y - z*w), 2 * (x*z + y*w)],
+                          [2 * (x*y + z*w), 1 - 2 * (x*x + z*z), 2 * (y*z - x*w)],
+                          [2 * (x*z - y*w), 2 * (y*z + x*w), 1 - 2 * (x*x + y*y)]],
+                         device=device, dtype=torch.float32)
+
+    cam = copy.deepcopy(ref_cam)
+    new_T = (1.0 - alpha) * t_ref + alpha * t_tgt
+    cam.set_pose(R_mid, new_T)
+    return cam
