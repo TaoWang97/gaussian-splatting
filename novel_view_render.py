@@ -73,7 +73,7 @@ if __name__ == "__main__":
         "--camera_name",
         default="CAM_FRONT",
         type=str,
-        choices=["CAM_FRONT","CAM_FRONT_LEFT","CAM_FRONT_LEFT","CAM_BACK", "CAM_BACK_LEFT", "CAM_BACK_RIGHT"],
+        choices=["CAM_FRONT","CAM_FRONT_LEFT","CAM_FRONT_RIGHT","CAM_BACK", "CAM_BACK_LEFT", "CAM_BACK_RIGHT"],
         help="Which camera to render"
     )
     args = get_combined_args(parser)
